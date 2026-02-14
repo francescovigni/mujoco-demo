@@ -65,9 +65,9 @@ class SimulationState(BaseModel):
     distance: float
 
 
-@app.get("/")
-async def root():
-    """Root endpoint."""
+@app.get("/health")
+async def health():
+    """Health check endpoint."""
     return {"message": "Rover Navigation API", "status": "running"}
 
 
