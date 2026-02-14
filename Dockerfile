@@ -2,7 +2,7 @@
 FROM node:20-alpine AS frontend
 WORKDIR /app
 COPY ui/frontend/package.json ui/frontend/package-lock.json ./
-RUN npm ci
+RUN npm install --ignore-scripts
 COPY ui/frontend/ .
 RUN npm run build
 
@@ -11,7 +11,7 @@ FROM python:3.13-slim
 
 # MuJoCo headless rendering (osmesa)
 RUN apt-get update && apt-get install -y --no-install-recommends \
-        libgl1-mesa-glx libosmesa6 libglfw3 libglew-dev \
+        libosmesa6 libglfw3 libglew-dev \
         patchelf gcc \
     && rm -rf /var/lib/apt/lists/*
 
