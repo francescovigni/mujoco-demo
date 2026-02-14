@@ -3,11 +3,12 @@ import './App.css';
 
 // Resolve API / WS URLs relative to the current host so the app works
 // both in local dev (CRA proxy) and behind a reverse-proxy in production.
-const _base = process.env.REACT_APP_API_URL || '';
-const API_URL  = _base || '';
+// Use /robot prefix when served behind Caddy reverse proxy.
+const _pathPrefix = process.env.PUBLIC_URL || '';
+const API_URL  = process.env.REACT_APP_API_URL || _pathPrefix;
 const _wsproto = window.location.protocol === 'https:' ? 'wss:' : 'ws:';
 const WS_URL   = process.env.REACT_APP_WS_URL
-  || `${_wsproto}//${window.location.host}/ws/simulation`;
+  || `${_wsproto}//${window.location.host}${_pathPrefix}/ws/simulation`;
 
 /* ------------------------------------------------------------------ */
 /*  Collapsible panel                                                  */
