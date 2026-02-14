@@ -237,7 +237,7 @@ async def websocket_simulation(websocket: WebSocket):
             if frame is not None:
                 img = Image.fromarray(frame)
                 buffer = io.BytesIO()
-                img.save(buffer, format="JPEG", quality=85)
+                img.save(buffer, format="JPEG", quality=65)
                 img_str = base64.b64encode(buffer.getvalue()).decode()
                 
                 initial_state = {
@@ -347,7 +347,7 @@ async def websocket_simulation(websocket: WebSocket):
                     if frame is not None:
                         img = Image.fromarray(frame)
                         buffer = io.BytesIO()
-                        img.save(buffer, format="JPEG", quality=85)
+                        img.save(buffer, format="JPEG", quality=65)
                         img_str = base64.b64encode(buffer.getvalue()).decode()
                         await websocket.send_json({
                             "type": "state",
@@ -398,7 +398,7 @@ async def websocket_simulation(websocket: WebSocket):
                     if frame is not None:
                         img = Image.fromarray(frame)
                         buffer = io.BytesIO()
-                        img.save(buffer, format="JPEG", quality=85)
+                        img.save(buffer, format="JPEG", quality=65)
                         img_str = base64.b64encode(buffer.getvalue()).decode()
                     else:
                         img_str = ""

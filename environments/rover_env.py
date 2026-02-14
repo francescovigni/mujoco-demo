@@ -10,7 +10,7 @@ from typing import Optional, Tuple, Dict, Any
 class RoverNavigationEnv(gym.Env):
     """Custom environment for wheeled rover navigation."""
     
-    metadata = {"render_modes": ["human", "rgb_array"], "render_fps": 50}
+    metadata = {"render_modes": ["human", "rgb_array"], "render_fps": 30}
     
     def __init__(
         self,
