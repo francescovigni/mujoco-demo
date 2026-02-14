@@ -1,9 +1,9 @@
 import React, { useState, useEffect, useCallback, useRef } from 'react';
 import './App.css';
+import Scene3D from './Scene3D';
 
 // Resolve API / WS URLs relative to the current host so the app works
 // both in local dev (CRA proxy) and behind a reverse-proxy in production.
-// Use /robot prefix when served behind Caddy reverse proxy.
 const _pathPrefix = process.env.PUBLIC_URL || '';
 const API_URL  = process.env.REACT_APP_API_URL || _pathPrefix;
 const _wsproto = window.location.protocol === 'https:' ? 'wss:' : 'ws:';
@@ -39,17 +39,19 @@ function App() {
   const [targetX, setTargetX] = useState('10.0');
   const [targetY, setTargetY] = useState('5.0');
 
-  const [currentFrame, setCurrentFrame] = useState(null);
+  // Scene data from /initialize (obstacles, target, etc.)
+  const [sceneData, setSceneData] = useState(null);
+  
+  // Real-time rover state from WebSocket
+  const [roverPosition, setRoverPosition] = useState([0, 0, 0.12]);
+  const [roverQuaternion, setRoverQuaternion] = useState([1, 0, 0, 0]);
+  const [targetPosition, setTargetPosition] = useState([10, 5]);
+  const [path, setPath] = useState([]);
+  
+  // Telemetry
   const [simState, setSimState] = useState({
-    position: [0, 0], target: [10, 5], distance: 0, speed: 0, reward: 0,
+    distance: 0, speed: 0,
   });
-
-  /* camera */
-  const [cameraDistance, setCameraDistance] = useState(5.4);
-  const [cameraAzimuth, setCameraAzimuth] = useState(13.0);
-  const [cameraElevation, setCameraElevation] = useState(-26.0);
-  const cameraRef = useRef({ distance: 5.0, azimuth: 90.0, elevation: -20.0 });
-  const dragRef   = useRef({ isDragging: false, lastX: 0, lastY: 0 });
 
   /* repulsive field */
   const [repulseRange, setRepulseRange]     = useState(1.2);
@@ -61,7 +63,6 @@ function App() {
   const [numPathPoints, setNumPathPoints]   = useState(40);
 
   const wsRef  = useRef(null);
-  const imgRef = useRef(null);
 
   /* ---- fetch models ---- */
   useEffect(() => {
@@ -80,8 +81,19 @@ function App() {
     ws.onmessage = (ev) => {
       const d = JSON.parse(ev.data);
       if (d.type === 'state') {
-        setSimState({ position: d.position, target: d.target, distance: d.distance, speed: d.height, reward: d.reward });
-        if (d.frame) setCurrentFrame(`data:image/jpeg;base64,${d.frame}`);
+        // Update rover pose
+        if (d.position) setRoverPosition(d.position);
+        if (d.quaternion) setRoverQuaternion(d.quaternion);
+        if (d.target) setTargetPosition(d.target);
+        if (d.path) setPath(d.path);
+        setSimState({
+          distance: d.distance || 0,
+          speed: d.speed || 0,
+        });
+      } else if (d.type === 'target_update') {
+        if (d.target) setTargetPosition(d.target);
+      } else if (d.type === 'path_update') {
+        if (d.path) setPath(d.path);
       } else if (d.type === 'episode_end') {
         setIsRunning(false);
       }
@@ -97,10 +109,6 @@ function App() {
   const wsSend = useCallback((obj) => {
     if (wsRef.current?.readyState === WebSocket.OPEN) wsRef.current.send(JSON.stringify(obj));
   }, []);
-
-  const sendCamera = useCallback((dist, az, el) => {
-    wsSend({ type: 'camera_update', distance: dist, azimuth: az, elevation: el });
-  }, [wsSend]);
 
   const sendRepulsive = useCallback((range, gain, margin) => {
     wsSend({ type: 'repulsive_params', repulse_range: range, repulse_gain: gain, obstacle_margin: margin });
@@ -118,8 +126,20 @@ function App() {
         method: 'POST', headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ model_name: selectedModel }),
       });
-      if (r.ok) { setInitialized(true); connectWS(); }
-    } catch {}
+      if (r.ok) {
+        const data = await r.json();
+        if (data.scene) {
+          setSceneData(data.scene);
+          setRoverPosition(data.scene.roverPosition || [0, 0, 0.12]);
+          setRoverQuaternion(data.scene.roverQuaternion || [1, 0, 0, 0]);
+          setTargetPosition(data.scene.target || [10, 5]);
+        }
+        setInitialized(true);
+        connectWS();
+      }
+    } catch (e) {
+      console.error('Init error:', e);
+    }
   };
 
   const handleStart = () => { wsSend({ type: 'start' }); setIsRunning(true); };
@@ -128,47 +148,10 @@ function App() {
 
   const handleSetTarget = () => {
     const x = parseFloat(targetX), y = parseFloat(targetY);
-    if (!isNaN(x) && !isNaN(y)) wsSend({ type: 'set_target', x, y });
-  };
-
-  /* ---- camera interaction ---- */
-  const onMouseDown = useCallback((e) => {
-    dragRef.current = { isDragging: true, lastX: e.clientX, lastY: e.clientY };
-    e.preventDefault();
-  }, []);
-
-  const onMouseMove = useCallback((e) => {
-    const dr = dragRef.current;
-    if (!dr.isDragging) return;
-    const cam = cameraRef.current;
-    cam.azimuth   += (e.clientX - dr.lastX) * 0.5;
-    cam.elevation  = Math.max(-89, Math.min(89, cam.elevation + (e.clientY - dr.lastY) * 0.5));
-    dr.lastX = e.clientX; dr.lastY = e.clientY;
-    setCameraAzimuth(cam.azimuth); setCameraElevation(cam.elevation);
-    sendCamera(cam.distance, cam.azimuth, cam.elevation);
-  }, [sendCamera]);
-
-  const onMouseUp = useCallback(() => { dragRef.current.isDragging = false; }, []);
-
-  useEffect(() => {
-    const el = imgRef.current;
-    if (!el) return;
-    const onWheel = (e) => {
-      e.preventDefault();
-      const cam = cameraRef.current;
-      cam.distance = Math.max(1, Math.min(20, cam.distance + e.deltaY * 0.01));
-      setCameraDistance(cam.distance);
-      sendCamera(cam.distance, cam.azimuth, cam.elevation);
-    };
-    el.addEventListener('wheel', onWheel, { passive: false });
-    return () => el.removeEventListener('wheel', onWheel);
-  }, [sendCamera, currentFrame]);
-
-  const resetCamera = () => {
-    const c = { distance: 5, azimuth: 90, elevation: -20 };
-    cameraRef.current = { ...c };
-    setCameraDistance(c.distance); setCameraAzimuth(c.azimuth); setCameraElevation(c.elevation);
-    sendCamera(c.distance, c.azimuth, c.elevation);
+    if (!isNaN(x) && !isNaN(y)) {
+      wsSend({ type: 'set_target', x, y });
+      setTargetPosition([x, y]);
+    }
   };
 
   /* ---- connection dot ---- */
@@ -181,7 +164,6 @@ function App() {
       {/* ---------- sidebar ---------- */}
       <aside className="sidebar">
         <div className="sidebar-top">
-          {/* brand */}
           <h1 className="brand">Rover&nbsp;Nav</h1>
           <span className="conn-dot" style={{ background: connColor }} title={connectionStatus} />
         </div>
@@ -198,7 +180,7 @@ function App() {
             <span className="tag">MuJoCo</span>
             <span className="tag">Python</span>
             <span className="tag">FastAPI</span>
-            <span className="tag">WebSocket</span>
+            <span className="tag">Three.js</span>
             <span className="tag">React</span>
           </div>
         </Panel>
@@ -253,7 +235,7 @@ function App() {
               </div>
             </Panel>
 
-            {/* repulsive field */}
+            {/* path planner */}
             <Panel title="Path Planner" defaultOpen={true}>
               <Slider label="Path Points" value={numPathPoints} min={10} max={100} step={5} unit=""
                 onChange={v => { setNumPathPoints(v); sendRoverParams(speedFactor, v); }} />
@@ -271,44 +253,35 @@ function App() {
               }}>Reset defaults</button>
             </Panel>
 
-            {/* camera */}
+            {/* camera help */}
             <Panel title="Camera" defaultOpen={false}>
-              <div className="cam-stats">
-                <span>Dist {cameraDistance.toFixed(1)}m</span>
-                <span>Az {cameraAzimuth.toFixed(0)}°</span>
-                <span>El {cameraElevation.toFixed(0)}°</span>
-              </div>
-              <button className="btn btn-link" onClick={resetCamera}>Reset camera</button>
-              <p className="help-hint">Drag viewport to orbit · scroll to zoom</p>
+              <p className="help-hint">
+                Left-drag to orbit · Right-drag to pan · Scroll to zoom
+              </p>
             </Panel>
           </>
         )}
 
         <div className="sidebar-footer">
-          Built with MuJoCo + React
+          Built with MuJoCo + Three.js
         </div>
       </aside>
 
       {/* ---------- viewport ---------- */}
-      <main
-        className="viewport"
-        onMouseMove={onMouseMove}
-        onMouseUp={onMouseUp}
-        onMouseLeave={onMouseUp}
-      >
-        {currentFrame ? (
+      <main className="viewport">
+        {sceneData ? (
           <>
-            <img
-              ref={imgRef}
-              src={currentFrame}
-              alt="Simulation"
-              className="sim-frame"
-              onMouseDown={onMouseDown}
-              draggable={false}
+            <Scene3D
+              sceneData={sceneData}
+              roverPosition={roverPosition}
+              roverQuaternion={roverQuaternion}
+              targetPosition={targetPosition}
+              path={path}
+              isRunning={isRunning}
             />
             {/* telemetry strip */}
             <div className="telemetry">
-              <span>Pos ({simState.position[0].toFixed(1)}, {simState.position[1].toFixed(1)})</span>
+              <span>Pos ({roverPosition[0].toFixed(1)}, {roverPosition[1].toFixed(1)})</span>
               <span className="sep" />
               <span>Dist {simState.distance.toFixed(2)}m</span>
               <span className="sep" />

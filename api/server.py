@@ -9,9 +9,6 @@ from typing import List, Optional, Dict, Any
 import numpy as np
 import asyncio
 import json
-import base64
-from PIL import Image
-import io
 import sys
 import os
 import traceback
@@ -38,12 +35,6 @@ app.add_middleware(
 current_env: Optional[RoverNavigationEnv] = None
 current_controller: Optional[RoverController] = None
 simulation_running = False
-
-# Camera state
-camera_distance = 5.4
-camera_azimuth = 26.0
-camera_elevation = -19.0
-camera_lookat = [0.0, 0.0, 0.3]
 
 
 class TargetPosition(BaseModel):
@@ -107,9 +98,9 @@ async def initialize_environment(config: RobotConfig):
         
         model_config = ROBOT_MODELS[config.model_name]
         
-        # Create environment
+        # Create environment (no rendering needed - Three.js handles it)
         current_env = RoverNavigationEnv(
-            render_mode="rgb_array",
+            render_mode=None,
             target_pos=np.array([10.0, 5.0])
         )
         
@@ -122,14 +113,29 @@ async def initialize_environment(config: RobotConfig):
         obs, info = current_env.reset()
         simulation_running = False
         
+        # Return scene data for Three.js
         return {
             "status": "initialized",
             "model": config.model_name,
-            "observation_shape": obs.shape,
-            "action_shape": current_env.action_space.shape,
+            "scene": {
+                "obstacles": [
+                    {
+                        "position": obs_data["position"],
+                        "radius": obs_data["radius"],
+                        "height": obs_data["height"],
+                        "color": obs_data["color"][:3],  # RGB only
+                    }
+                    for obs_data in current_env.obstacles
+                ],
+                "target": current_env.target_pos.tolist(),
+                "roverPosition": current_env.data.qpos[:3].tolist(),  # x, y, z
+                "roverQuaternion": current_env.data.qpos[3:7].tolist(),  # w, x, y, z
+                "groundSize": 40.0,
+            }
         }
     
     except Exception as e:
+        traceback.print_exc()
         return JSONResponse(
             status_code=500,
             content={"error": str(e)}
@@ -208,64 +214,48 @@ async def get_state():
 
 @app.websocket("/ws/simulation")
 async def websocket_simulation(websocket: WebSocket):
-    """WebSocket endpoint for real-time simulation."""
+    """WebSocket endpoint for real-time simulation.
+    
+    Sends lightweight state data for Three.js client-side rendering.
+    No server-side frame rendering - much faster!
+    """
     global current_env, current_controller, simulation_running
-    global camera_distance, camera_azimuth, camera_elevation, camera_lookat
     
     await websocket.accept()
     print("WebSocket accepted, connection established")
     
-    # Send initial frame if environment exists
+    # Send initial state if environment exists
     if current_env is not None:
         try:
-            print("Sending initial frame...")
-            # Update camera lookat to rover position
-            camera_lookat = [current_env.data.qpos[0], current_env.data.qpos[1], 0.3]
-            
-            # Compute planned path for visualisation
             planned_path = None
             if current_controller is not None:
                 planned_path = current_controller.compute_path(current_env.data.qpos[:2])
             
-            frame = current_env.render(
-                camera_distance=camera_distance,
-                camera_azimuth=camera_azimuth,
-                camera_elevation=camera_elevation,
-                camera_lookat=camera_lookat,
-                path=planned_path,
-            )
-            if frame is not None:
-                img = Image.fromarray(frame)
-                buffer = io.BytesIO()
-                img.save(buffer, format="JPEG", quality=65)
-                img_str = base64.b64encode(buffer.getvalue()).decode()
-                
-                initial_state = {
-                    "type": "state",
-                    "position": current_env.data.qpos[:2].tolist(),
-                    "target": current_env.target_pos.tolist(),
-                    "distance": float(np.linalg.norm(current_env.data.qpos[:2] - current_env.target_pos)),
-                    "height": float(np.linalg.norm(current_env.data.qvel[:2])),
-                    "frame": img_str,
-                    "terminated": False,
-                    "truncated": False,
-                    "reward": 0.0,
-                }
-                await websocket.send_json(initial_state)
-                print("Initial frame sent successfully")
-            else:
-                print("Warning: render() returned None")
+            initial_state = {
+                "type": "state",
+                "position": current_env.data.qpos[:3].tolist(),  # x, y, z
+                "quaternion": current_env.data.qpos[3:7].tolist(),  # w, x, y, z
+                "target": current_env.target_pos.tolist(),
+                "distance": float(np.linalg.norm(current_env.data.qpos[:2] - current_env.target_pos)),
+                "speed": float(np.linalg.norm(current_env.data.qvel[:2])),
+                "path": planned_path.tolist() if planned_path is not None else [],
+                "terminated": False,
+                "truncated": False,
+            }
+            await websocket.send_json(initial_state)
+            print("Initial state sent")
         except Exception as e:
-            print(f"Error sending initial frame: {e}")
+            print(f"Error sending initial state: {e}")
             traceback.print_exc()
     else:
         print("Warning: No environment initialized")
     
     try:
         print("Entering WebSocket main loop...")
+        path_dirty = False  # Track if path needs recompute
+        
         while True:
-            # Drain ALL pending messages before rendering
-            camera_changed = False
+            # Drain ALL pending messages
             while True:
                 try:
                     data = await asyncio.wait_for(websocket.receive_text(), timeout=0.005)
@@ -283,17 +273,13 @@ async def websocket_simulation(websocket: WebSocket):
                             current_controller.set_target(target)
                             current_env.target_pos = target
                             current_env._update_target_marker()
-                            print(f"✅ Target set to: {target} and marker updated")
-                    elif message["type"] == "camera_update":
-                        if "distance" in message:
-                            camera_distance = float(message["distance"])
-                        if "azimuth" in message:
-                            camera_azimuth = float(message["azimuth"])
-                        if "elevation" in message:
-                            camera_elevation = float(message["elevation"])
-                        if "lookat" in message:
-                            camera_lookat = message["lookat"]
-                        camera_changed = True
+                            path_dirty = True
+                            # Send target update immediately
+                            await websocket.send_json({
+                                "type": "target_update",
+                                "target": target.tolist(),
+                            })
+                            print(f"Target set to: {target}")
                     elif message["type"] == "repulsive_params":
                         if current_controller:
                             if "repulse_range" in message:
@@ -302,26 +288,39 @@ async def websocket_simulation(websocket: WebSocket):
                                 current_controller.repulse_gain = float(message["repulse_gain"])
                             if "obstacle_margin" in message:
                                 current_controller.obstacle_margin = float(message["obstacle_margin"])
-                            camera_changed = True   # re-render to update the path
+                            path_dirty = True
                     elif message["type"] == "rover_params":
                         if current_controller:
                             if "speed_factor" in message:
                                 current_controller.speed_factor = float(message["speed_factor"])
                             if "num_path_points" in message:
                                 current_controller.num_path_points = int(message["num_path_points"])
-                            camera_changed = True   # re-render to update the path
+                            path_dirty = True
                     elif message["type"] == "reset":
                         if current_env:
                             current_env.reset()
                             if current_controller:
                                 current_controller.reset()
+                            # Send reset state
+                            planned_path = current_controller.compute_path(current_env.data.qpos[:2]) if current_controller else None
+                            await websocket.send_json({
+                                "type": "state",
+                                "position": current_env.data.qpos[:3].tolist(),
+                                "quaternion": current_env.data.qpos[3:7].tolist(),
+                                "target": current_env.target_pos.tolist(),
+                                "distance": float(np.linalg.norm(current_env.data.qpos[:2] - current_env.target_pos)),
+                                "speed": 0.0,
+                                "path": planned_path.tolist() if planned_path is not None else [],
+                                "terminated": False,
+                                "truncated": False,
+                            })
                         simulation_running = False
                         print("Environment reset")
                 except asyncio.TimeoutError:
-                    break  # No more messages pending
+                    break
                 except RuntimeError as e:
                     if "disconnect" in str(e).lower():
-                        raise  # Re-raise to exit outer loop
+                        raise
                     print(f"Runtime error: {e}")
                     break
                 except Exception as e:
@@ -329,40 +328,17 @@ async def websocket_simulation(websocket: WebSocket):
                     traceback.print_exc()
                     break
 
-            # Send camera frame if camera changed and simulation is NOT running
-            # (if simulation is running, the sim loop will handle rendering)
-            if camera_changed and not simulation_running and current_env is not None:
+            # Send path update if parameters changed (and not running)
+            if path_dirty and not simulation_running and current_env is not None and current_controller is not None:
                 try:
-                    camera_lookat = [current_env.data.qpos[0], current_env.data.qpos[1], 0.3]
-                    planned_path = None
-                    if current_controller is not None:
-                        planned_path = current_controller.compute_path(current_env.data.qpos[:2])
-                    frame = current_env.render(
-                        camera_distance=camera_distance,
-                        camera_azimuth=camera_azimuth,
-                        camera_elevation=camera_elevation,
-                        camera_lookat=camera_lookat,
-                        path=planned_path,
-                    )
-                    if frame is not None:
-                        img = Image.fromarray(frame)
-                        buffer = io.BytesIO()
-                        img.save(buffer, format="JPEG", quality=65)
-                        img_str = base64.b64encode(buffer.getvalue()).decode()
-                        await websocket.send_json({
-                            "type": "state",
-                            "position": current_env.data.qpos[:2].tolist(),
-                            "target": current_env.target_pos.tolist(),
-                            "distance": float(np.linalg.norm(current_env.data.qpos[:2] - current_env.target_pos)),
-                            "height": float(np.linalg.norm(current_env.data.qvel[:2])),
-                            "frame": img_str,
-                            "terminated": False,
-                            "truncated": False,
-                            "reward": 0.0,
-                        })
+                    planned_path = current_controller.compute_path(current_env.data.qpos[:2])
+                    await websocket.send_json({
+                        "type": "path_update",
+                        "path": planned_path.tolist(),
+                    })
+                    path_dirty = False
                 except Exception as e:
-                    print(f"Error rendering camera update: {e}")
-                    traceback.print_exc()
+                    print(f"Error sending path update: {e}")
             
             # Run simulation step if active
             if simulation_running and current_env and current_controller:
@@ -370,8 +346,8 @@ async def websocket_simulation(websocket: WebSocket):
                     # Get current state
                     current_pos = current_env.data.qpos[:2]
                     current_vel = current_env.data.qvel[:2]
-                    body_quat = current_env.data.qpos[3:7].copy()  # chassis quaternion
-                    body_angvel = current_env.data.qvel[3:6].copy()  # chassis angular velocity
+                    body_quat = current_env.data.qpos[3:7].copy()
+                    body_angvel = current_env.data.qvel[3:6].copy()
                     
                     # Get action from controller
                     action = current_controller.get_action(current_pos, current_vel, body_quat, body_angvel)
@@ -379,41 +355,20 @@ async def websocket_simulation(websocket: WebSocket):
                     # Step environment
                     obs, reward, terminated, truncated, info = current_env.step(action)
                     
-                    # Update camera lookat to follow rover
-                    camera_lookat = [current_env.data.qpos[0], current_env.data.qpos[1], 0.3]
-                    
-                    # Compute planned path for visualisation
+                    # Compute path (less frequently during simulation for performance)
                     planned_path = current_controller.compute_path(current_env.data.qpos[:2])
                     
-                    # Render with camera parameters and path overlay
-                    frame = current_env.render(
-                        camera_distance=camera_distance,
-                        camera_azimuth=camera_azimuth,
-                        camera_elevation=camera_elevation,
-                        camera_lookat=camera_lookat,
-                        path=planned_path,
-                    )
-                    
-                    # Convert frame to base64
-                    if frame is not None:
-                        img = Image.fromarray(frame)
-                        buffer = io.BytesIO()
-                        img.save(buffer, format="JPEG", quality=65)
-                        img_str = base64.b64encode(buffer.getvalue()).decode()
-                    else:
-                        img_str = ""
-                    
-                    # Send state update
+                    # Send lightweight state update (no frame!)
                     state_update = {
                         "type": "state",
-                        "position": current_pos.tolist(),
+                        "position": current_env.data.qpos[:3].tolist(),  # x, y, z
+                        "quaternion": current_env.data.qpos[3:7].tolist(),  # w, x, y, z
                         "target": current_env.target_pos.tolist(),
                         "distance": float(info["distance_to_target"]),
-                        "height": float(info.get("speed", 0.0)),
-                        "frame": img_str,
+                        "speed": float(info.get("speed", 0.0)),
+                        "path": planned_path.tolist(),
                         "terminated": bool(terminated),
                         "truncated": bool(truncated),
-                        "reward": float(reward),
                     }
                     
                     await websocket.send_json(state_update)
@@ -430,7 +385,7 @@ async def websocket_simulation(websocket: WebSocket):
                     print(f"Error in simulation step: {e}")
                     traceback.print_exc()
             
-            await asyncio.sleep(0.01)  # ~100 FPS max
+            await asyncio.sleep(0.016)  # ~60 FPS target
             
     except WebSocketDisconnect:
         print("Client disconnected normally")
